@@ -532,7 +532,7 @@ define Device/FRITZ3370
   $(Device/AVM)
   $(Device/NAND)
   DEVICE_TITLE := Fritz!Box WLan - FRITZ3370
-  DEVICE_PACKAGES := kmod-ath9k wpad-mini kmod-usb-dwc2
+  DEVICE_PACKAGES := kmod-ath9k wpad-mini kmod-usb-dwc2 fritz-tffs
 endef
 TARGET_DEVICES += FRITZ3370
 

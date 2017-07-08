@@ -1,0 +1,51 @@
+From a1db9d8df3f2fc627bd80fabd6eaf8ecbb263475 Mon Sep 17 00:00:00 2001
+From: Andrea Merello <andrea.merello@gmail.com>
+Date: Sat, 8 Jul 2017 09:18:11 +0200
+Subject: [PATCH] [Lantiq][net]: fix sleep with spinlock held in xrx200 network
+ driver
+
+In the xrx200_close() function we call napi_disable(), that could
+sleep, with priv->hw->chan[i].lock held. This could lead to deadlock
+and causes the kernel to complain.
+
+Look at the code I couldn't convince myself about why we
+need to protect that specific code part with the lock. IMHO there
+seems no reason to protect the refcount variables, because AFAIK
+ndo_close() and ndo_open() callbacks are already called with a
+semaphore held. Neither I could figure out why napi_disable() have to
+be called with that lock held. The only remaining code part for
+which I could guess the lock is useful for is ltq_dma_close()
+function call.
+
+This patch reduces the lock to the said function call, avoiding the
+sleep-with-spinlock-held situation
+
+Signed-off-by: Andrea Merello <andrea.merello@gmail.com>
+---
+ drivers/net/ethernet/lantiq_xrx200.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq_xrx200.c b/drivers/net/ethernet/lantiq_xrx200.c
+index 0d2bfe7..b7d9afd 100644
+--- a/drivers/net/ethernet/lantiq_xrx200.c
++++ b/drivers/net/ethernet/lantiq_xrx200.c
+@@ -898,14 +898,15 @@ static int xrx200_close(struct net_device *dev)
+	for (i = 0; i < XRX200_MAX_DMA; i++) {
+		if (!priv->hw->chan[i].dma.irq)
+			continue;
+-		spin_lock_bh(&priv->hw->chan[i].lock);
++
+		priv->hw->chan[i].refcount--;
+		if (!priv->hw->chan[i].refcount) {
+			if (XRX200_DMA_IS_RX(i))
+				napi_disable(&priv->hw->chan[i].napi);
++			spin_lock_bh(&priv->hw->chan[i].lock);
+			ltq_dma_close(&priv->hw->chan[XRX200_DMA_RX].dma);
++			spin_unlock_bh(&priv->hw->chan[i].lock);
+		}
+-		spin_unlock_bh(&priv->hw->chan[i].lock);
+	}
+
+	return 0;
+--
+2.7.4

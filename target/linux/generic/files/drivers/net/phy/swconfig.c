@@ -36,7 +36,7 @@ MODULE_LICENSE("GPL");
 
 static int swdev_id;
 static struct list_head swdevs;
-static DEFINE_SPINLOCK(swdevs_lock);
+struct mutex swdevs_lock;
 struct swconfig_callback;
 
 struct swconfig_callback {
@@ -302,13 +302,13 @@ static struct nla_policy link_policy[SWITCH_LINK_ATTR_MAX] = {
 static inline void
 swconfig_lock(void)
 {
-	spin_lock(&swdevs_lock);
+	mutex_lock(&swdevs_lock);
 }
 
 static inline void
 swconfig_unlock(void)
 {
-	spin_unlock(&swdevs_lock);
+	mutex_unlock(&swdevs_lock);
 }
 
 static struct switch_dev *
@@ -1222,7 +1222,7 @@ static int __init
 swconfig_init(void)
 {
 	INIT_LIST_HEAD(&swdevs);
-	
+	mutex_init(&swdevs_lock);
 	return genl_register_family_with_ops(&switch_fam, swconfig_ops);
 }
 

@@ -1,0 +1,82 @@
+From 464bdd10f8c50d7db51a16de3ffbaff038fa809d Mon Sep 17 00:00:00 2001
+From: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Date: Sat, 29 Apr 2017 11:06:43 +0200
+Subject: [PATCH 2/4] mtd: nand: add core support for on-die ECC
+
+A number of NAND flashes have a capability called "on-die ECC" where the
+NAND chip itself is capable of detecting and correcting errors.
+
+Linux already has support for using the ECC implementation of the NAND
+controller, or a software based ECC implementation, but not for using
+the ECC implementation of the NAND controller. However, such an
+implementation is sometimes useful in situations where the NAND
+controller provides ECC algorithms that are not strong enough for the
+NAND chip used on the system. A typical case is a NAND chip that
+requires a 4-bit ECC, while the NAND controller only provides a 1-bit
+ECC algorithm.
+
+This commit introduces the support for the NAND_ECC_ON_DIE ECC mode:
+
+ - Parsing of the "on-die" value for the "nand-ecc-mode" Device Tree
+   property
+
+ - Handling NAND_ECC_ON_DIE case in nand_scan_tail(). The idea is that
+   the vendor specific code for the NAND chip must implement
+   ->read_page() and ->write_page(). It may optionally provide its own
+   ->read_page_raw() and ->write_page_raw() as well. For OOB operation,
+   we assume the standard operations are good enough, but they can be
+   overridden by the vendor specific code if needed.
+
+Signed-off-by: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Reviewed-by: Richard Weinberger <richard@nod.at>
+---
+ drivers/mtd/nand/nand_base.c | 13 +++++++++++++
+ include/linux/mtd/nand.h     |  1 +
+ 2 files changed, 14 insertions(+)
+
+diff --git a/drivers/mtd/nand/nand_base.c b/drivers/mtd/nand/nand_base.c
+index f222f8a..76a650c 100644
+--- a/drivers/mtd/nand/nand_base.c
++++ b/drivers/mtd/nand/nand_base.c
+@@ -4217,6 +4217,7 @@ static const char * const nand_ecc_modes[] = {
+ 	[NAND_ECC_HW]		= "hw",
+ 	[NAND_ECC_HW_SYNDROME]	= "hw_syndrome",
+ 	[NAND_ECC_HW_OOB_FIRST]	= "hw_oob_first",
++	[NAND_ECC_ON_DIE]	= "on-die",
+ };
+ 
+ static int of_get_nand_ecc_mode(struct device_node *np)
+@@ -4726,6 +4727,18 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		}
+ 		break;
+ 
++	case NAND_ECC_ON_DIE:
++		if (!ecc->read_page || !ecc->write_page) {
++			WARN(1, "No ECC functions supplied; on-die ECC not possible\n");
++			ret = -EINVAL;
++			goto err_free;
++		}
++		if (!ecc->read_oob)
++			ecc->read_oob = nand_read_oob_std;
++		if (!ecc->write_oob)
++			ecc->write_oob = nand_write_oob_std;
++		break;
++
+ 	case NAND_ECC_NONE:
+ 		pr_warn("NAND_ECC_NONE selected by board driver. This is not recommended!\n");
+ 		ecc->read_page = nand_read_page_raw;
+diff --git a/include/linux/mtd/nand.h b/include/linux/mtd/nand.h
+index d8905a2..07c95bf 100644
+--- a/include/linux/mtd/nand.h
++++ b/include/linux/mtd/nand.h
+@@ -116,6 +116,7 @@ typedef enum {
+ 	NAND_ECC_HW,
+ 	NAND_ECC_HW_SYNDROME,
+ 	NAND_ECC_HW_OOB_FIRST,
++	NAND_ECC_ON_DIE,
+ } nand_ecc_modes_t;
+ 
+ enum nand_ecc_algo {
+-- 
+2.7.4
+

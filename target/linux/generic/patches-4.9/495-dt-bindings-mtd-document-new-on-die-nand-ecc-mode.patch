@@ -1,0 +1,33 @@
+From 1d4ac468aa61a347e2cfa93b39321e4667e07739 Mon Sep 17 00:00:00 2001
+From: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Date: Sat, 29 Apr 2017 11:06:42 +0200
+Subject: [PATCH 1/4] dt-bindings: mtd: document new "on-die" nand-ecc-mode
+
+A number of NAND chips support a feature called on-die ECC, where the
+NAND chip itself is capable of doing error detection and correction. The
+new "on-die" value for nand-ecc-mode indicates that we want this
+functionality to be used.
+
+Signed-off-by: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Acked-by: Rob Herring <robh@kernel.org>
+Reviewed-by: Richard Weinberger <richard@nod.at>
+---
+ Documentation/devicetree/bindings/mtd/nand.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/mtd/nand.txt b/Documentation/devicetree/bindings/mtd/nand.txt
+index c096ca8..e64205b 100644
+--- a/Documentation/devicetree/bindings/mtd/nand.txt
++++ b/Documentation/devicetree/bindings/mtd/nand.txt
+@@ -21,7 +21,7 @@ Optional NAND chip properties:
+ 
+ - nand-ecc-mode : String, operation mode of the NAND ecc mode.
+ 		  Supported values are: "none", "soft", "hw", "hw_syndrome",
+-		  "hw_oob_first".
++		  "hw_oob_first", "on-die".
+ 		  Deprecated values:
+ 		  "soft_bch": use "soft" and nand-ecc-algo instead
+ - nand-ecc-algo: string, algorithm of NAND ECC.
+-- 
+2.7.4
+

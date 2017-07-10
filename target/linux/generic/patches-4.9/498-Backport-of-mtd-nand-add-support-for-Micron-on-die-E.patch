@@ -1,0 +1,359 @@
+From d615cce645ff127cc8830b6d583e4089652d1fcf Mon Sep 17 00:00:00 2001
+From: Andrea Merello <andrea.merello@gmail.com>
+Date: Tue, 27 Jun 2017 21:37:43 +0200
+Subject: [PATCH 4/4] Backport of: mtd: nand: add support for Micron on-die ECC
+
+This patch backports to linux-4.9 the following patch:
+Now that the core NAND subsystem has support for on-die ECC, this commit
+brings the necessary code to support on-die ECC on Micron NANDs.
+
+In micron_nand_init(), we detect if the Micron NAND chip supports on-die
+ECC mode, by checking a number of conditions:
+
+ - It must be an ONFI NAND
+ - It must be a SLC NAND
+
+ - Enabling *and* disabling on-die ECC must work
+
+ - The on-die ECC must be correcting 4 bits per 512 bytes of data. Some
+   Micron NAND chips have an on-die ECC able to correct 8 bits per 512
+   bytes of data, but they work slightly differently and therefore we
+   don't support them in this patch.
+
+Then, if the on-die ECC cannot be disabled (some Micron NAND have on-die
+ECC forcefully enabled), we bail out, as we don't support such
+NANDs. Indeed, the implementation of raw_read()/raw_write() make the
+assumption that on-die ECC can be disabled. Support for Micron NANDs
+with on-die ECC forcefully enabled can easily be added, but in the
+absence of such HW for testing, we preferred to simply bail out.
+
+If the on-die ECC is supported, and requested in the Device Tree, then
+it is indeed enabled, by using custom implementations of the
+->read_page(), ->read_page_raw(), ->write_page() and ->write_page_raw()
+operation to properly handle the on-die ECC.
+
+In the non-raw functions, we need to enable the internal ECC engine
+before issuing the NAND_CMD_READ0 or NAND_CMD_SEQIN commands, which is
+why we set the NAND_ECC_CUSTOM_PAGE_ACCESS option at initialization
+time (it asks the NAND core to let the NAND driver issue those
+commands).
+
+Signed-off-by: Thomas Petazzoni <thomas.petazzoni@free-electrons.com> [mainline patch]
+Signed-off-by: Andrea Merello <andrea.merello@gmail.com> [backport]
+---
+ drivers/mtd/nand/Makefile          |   2 +-
+ drivers/mtd/nand/micron_eccondie.c | 224 +++++++++++++++++++++++++++++++++++++
+ drivers/mtd/nand/micron_eccondie.h |   7 ++
+ drivers/mtd/nand/nand_base.c       |   5 +-
+ include/linux/mtd/nand.h           |   9 +-
+ 5 files changed, 244 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/mtd/nand/micron_eccondie.c
+ create mode 100644 drivers/mtd/nand/micron_eccondie.h
+
+diff --git a/drivers/mtd/nand/Makefile b/drivers/mtd/nand/Makefile
+index cafde6f..d4147e5 100644
+--- a/drivers/mtd/nand/Makefile
++++ b/drivers/mtd/nand/Makefile
+@@ -59,4 +59,4 @@ obj-$(CONFIG_MTD_NAND_BRCMNAND)		+= brcmnand/
+ obj-$(CONFIG_MTD_NAND_QCOM)		+= qcom_nandc.o
+ obj-$(CONFIG_MTD_NAND_MTK)		+= mtk_nand.o mtk_ecc.o
+ 
+-nand-objs := nand_base.o nand_bbt.o nand_timings.o
++nand-objs := nand_base.o nand_bbt.o nand_timings.o micron_eccondie.o
+diff --git a/drivers/mtd/nand/micron_eccondie.c b/drivers/mtd/nand/micron_eccondie.c
+new file mode 100644
+index 0000000..24e7edf
+--- /dev/null
++++ b/drivers/mtd/nand/micron_eccondie.c
+@@ -0,0 +1,224 @@
++#include <linux/mtd/nand.h>
++
++/*
++ * Special Micron status bit that indicates when the block has been
++ * corrected by on-die ECC and should be rewritten
++ */
++#define NAND_STATUS_WRITE_RECOMMENDED	BIT(3)
++
++static int micron_nand_on_die_ooblayout_ecc(struct mtd_info *mtd, int section,
++					    struct mtd_oob_region *oobregion)
++{
++	if (section >= 4)
++		return -ERANGE;
++
++	oobregion->offset = (section * 16) + 8;
++	oobregion->length = 8;
++
++	return 0;
++}
++
++static int micron_nand_on_die_ooblayout_free(struct mtd_info *mtd, int section,
++					     struct mtd_oob_region *oobregion)
++{
++	if (section >= 4)
++		return -ERANGE;
++
++	oobregion->offset = (section * 16) + 2;
++	oobregion->length = 6;
++
++	return 0;
++}
++
++static const struct mtd_ooblayout_ops micron_nand_on_die_ooblayout_ops = {
++	.ecc = micron_nand_on_die_ooblayout_ecc,
++	.free = micron_nand_on_die_ooblayout_free,
++};
++
++static int micron_nand_on_die_ecc_setup(struct nand_chip *chip, bool enable)
++{
++	u8 feature[ONFI_SUBFEATURE_PARAM_LEN] = { 0, };
++
++	if (enable)
++		feature[0] |= ONFI_FEATURE_ON_DIE_ECC_EN;
++
++	return chip->onfi_set_features(nand_to_mtd(chip), chip,
++				       ONFI_FEATURE_ON_DIE_ECC, feature);
++}
++
++static int
++micron_nand_read_page_on_die_ecc(struct mtd_info *mtd, struct nand_chip *chip,
++				 uint8_t *buf, int oob_required,
++				 int page)
++{
++	int status;
++	int max_bitflips = 0;
++
++	micron_nand_on_die_ecc_setup(chip, true);
++
++	chip->cmdfunc(mtd, NAND_CMD_READ0, 0x00, page);
++	chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
++	status = chip->read_byte(mtd);
++	if (status & NAND_STATUS_FAIL)
++		mtd->ecc_stats.failed++;
++	/*
++	 * The internal ECC doesn't tell us the number of bitflips
++	 * that have been corrected, but tells us if it recommends to
++	 * rewrite the block. If it's the case, then we pretend we had
++	 * a number of bitflips equal to the ECC strength, which will
++	 * hint the NAND core to rewrite the block.
++	 */
++	else if (status & NAND_STATUS_WRITE_RECOMMENDED)
++		max_bitflips = chip->ecc.strength;
++
++	chip->cmdfunc(mtd, NAND_CMD_READ0, -1, -1);
++
++	nand_read_page_raw(mtd, chip, buf, oob_required, page);
++
++	micron_nand_on_die_ecc_setup(chip, false);
++
++	return max_bitflips;
++}
++
++static int
++micron_nand_write_page_on_die_ecc(struct mtd_info *mtd, struct nand_chip *chip,
++				  const uint8_t *buf, int oob_required,
++				  int page)
++{
++	micron_nand_on_die_ecc_setup(chip, true);
++
++	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);
++	nand_write_page_raw(mtd, chip, buf, oob_required, page);
++	chip->cmdfunc(mtd, NAND_CMD_PAGEPROG, -1, -1);
++
++	micron_nand_on_die_ecc_setup(chip, false);
++
++	return 0;
++}
++
++static int
++micron_nand_read_page_raw_on_die_ecc(struct mtd_info *mtd,
++				     struct nand_chip *chip,
++				     uint8_t *buf, int oob_required,
++				     int page)
++{
++	chip->cmdfunc(mtd, NAND_CMD_READ0, 0x00, page);
++	nand_read_page_raw(mtd, chip, buf, oob_required, page);
++
++	return 0;
++}
++
++static int
++micron_nand_write_page_raw_on_die_ecc(struct mtd_info *mtd,
++				      struct nand_chip *chip,
++				      const uint8_t *buf, int oob_required,
++				      int page)
++{
++	chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, page);
++	nand_write_page_raw(mtd, chip, buf, oob_required, page);
++	chip->cmdfunc(mtd, NAND_CMD_PAGEPROG, -1, -1);
++
++	return 0;
++}
++
++enum {
++	/* The NAND flash doesn't support on-die ECC */
++	MICRON_ON_DIE_UNSUPPORTED,
++
++	/*
++	 * The NAND flash supports on-die ECC and it can be
++	 * enabled/disabled by a set features command.
++	 */
++	MICRON_ON_DIE_SUPPORTED,
++
++	/*
++	 * The NAND flash supports on-die ECC, and it cannot be
++	 * disabled.
++	 */
++	MICRON_ON_DIE_MANDATORY,
++};
++
++/*
++ * Try to detect if the NAND support on-die ECC. To do this, we enable
++ * the feature, and read back if it has been enabled as expected. We
++ * also check if it can be disabled, because some Micron NANDs do not
++ * allow disabling the on-die ECC and we don't support such NANDs for
++ * now.
++ *
++ * This function also has the side effect of disabling on-die ECC if
++ * it had been left enabled by the firmware/bootloader.
++ */
++static int micron_supports_on_die_ecc(struct nand_chip *chip)
++{
++	u8 feature[ONFI_SUBFEATURE_PARAM_LEN] = { 0, };
++	int ret;
++
++	if (chip->onfi_version == 0)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	if (chip->bits_per_cell != 1)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	ret = micron_nand_on_die_ecc_setup(chip, true);
++	if (ret)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	chip->onfi_get_features(nand_to_mtd(chip), chip,
++				ONFI_FEATURE_ON_DIE_ECC, feature);
++	if ((feature[0] & ONFI_FEATURE_ON_DIE_ECC_EN) == 0)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	ret = micron_nand_on_die_ecc_setup(chip, false);
++	if (ret)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	chip->onfi_get_features(nand_to_mtd(chip), chip,
++				ONFI_FEATURE_ON_DIE_ECC, feature);
++	if (feature[0] & ONFI_FEATURE_ON_DIE_ECC_EN)
++		return MICRON_ON_DIE_MANDATORY;
++
++	/*
++	 * Some Micron NANDs have an on-die ECC of 4/512, some other
++	 * 8/512. We only support the former.
++	 */
++	if (chip->onfi_params.ecc_bits != 4)
++		return MICRON_ON_DIE_UNSUPPORTED;
++
++	return MICRON_ON_DIE_SUPPORTED;
++}
++
++int micron_eccondie_init(struct nand_chip *chip)
++{
++	struct mtd_info *mtd = nand_to_mtd(chip);
++	int ondie;
++
++	ondie = micron_supports_on_die_ecc(chip);
++
++	if (ondie == MICRON_ON_DIE_MANDATORY) {
++		pr_err("On-die ECC forcefully enabled, not supported\n");
++		return -EINVAL;
++	}
++
++	if (chip->ecc.mode == NAND_ECC_ON_DIE) {
++		if (ondie == MICRON_ON_DIE_UNSUPPORTED) {
++			pr_err("On-die ECC selected but not supported\n");
++			return -EINVAL;
++		}
++
++		chip->ecc.options = NAND_ECC_CUSTOM_PAGE_ACCESS;
++		chip->ecc.bytes = 8;
++		chip->ecc.size = 512;
++		chip->ecc.strength = 4;
++		chip->ecc.algo = NAND_ECC_BCH;
++		chip->ecc.read_page = micron_nand_read_page_on_die_ecc;
++		chip->ecc.write_page = micron_nand_write_page_on_die_ecc;
++		chip->ecc.read_page_raw =
++			micron_nand_read_page_raw_on_die_ecc;
++		chip->ecc.write_page_raw =
++			micron_nand_write_page_raw_on_die_ecc;
++
++		mtd_set_ooblayout(mtd, &micron_nand_on_die_ooblayout_ops);
++	}
++
++	return 0;
++}
+diff --git a/drivers/mtd/nand/micron_eccondie.h b/drivers/mtd/nand/micron_eccondie.h
+new file mode 100644
+index 0000000..1216a82
+--- /dev/null
++++ b/drivers/mtd/nand/micron_eccondie.h
+@@ -0,0 +1,7 @@
++#ifndef MICRON_ECCONDIE_H
++#define MICRON_ECCONDIE_H
++
++#include <linux/mtd/nand.h>
++int micron_eccondie_init(struct nand_chip *chip);
++
++#endif
+diff --git a/drivers/mtd/nand/nand_base.c b/drivers/mtd/nand/nand_base.c
+index a7b42b3..066e6cc 100644
+--- a/drivers/mtd/nand/nand_base.c
++++ b/drivers/mtd/nand/nand_base.c
+@@ -46,6 +46,7 @@
+ #include <linux/io.h>
+ #include <linux/mtd/partitions.h>
+ #include <linux/of.h>
++#include "micron_eccondie.h"
+ 
+ static int nand_get_device(struct mtd_info *mtd, int new_state);
+ 
+@@ -3662,8 +3663,10 @@ static int nand_flash_detect_onfi(struct mtd_info *mtd, struct nand_chip *chip,
+ 		pr_warn("Could not retrieve ONFI ECC requirements\n");
+ 	}
+ 
+-	if (p->jedec_id == NAND_MFR_MICRON)
++	if (p->jedec_id == NAND_MFR_MICRON) {
+ 		nand_onfi_detect_micron(chip, p);
++		micron_eccondie_init(chip);
++	}
+ 
+ 	return 1;
+ }
+diff --git a/include/linux/mtd/nand.h b/include/linux/mtd/nand.h
+index 8fd7ab7..525b1f6 100644
+--- a/include/linux/mtd/nand.h
++++ b/include/linux/mtd/nand.h
+@@ -143,7 +143,12 @@ enum nand_ecc_algo {
+  */
+ #define NAND_ECC_GENERIC_ERASED_CHECK	BIT(0)
+ #define NAND_ECC_MAXIMIZE		BIT(1)
+-
++/*
++ * If your controller already sends the required NAND commands when
++ * reading or writing a page, then the framework is not supposed to
++ * send READ0 and SEQIN/PAGEPROG respectively.
++ */
++#define NAND_ECC_CUSTOM_PAGE_ACCESS	BIT(2)
+ /* Bit mask for flags passed to do_nand_read_ecc */
+ #define NAND_GET_DEVICE		0x80
+ 
+@@ -241,6 +246,8 @@ struct nand_chip;
+ 
+ /* Vendor-specific feature address (Micron) */
+ #define ONFI_FEATURE_ADDR_READ_RETRY	0x89
++#define ONFI_FEATURE_ON_DIE_ECC		0x90
++#define   ONFI_FEATURE_ON_DIE_ECC_EN	BIT(3)
+ 
+ /* ONFI subfeature parameters length */
+ #define ONFI_SUBFEATURE_PARAM_LEN	4
+-- 
+2.7.4
+

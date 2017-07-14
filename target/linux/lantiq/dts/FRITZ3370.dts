@@ -33,7 +33,7 @@
 				reg = <1 0x0 0x2000000>;
 				#address-cells = <1>;
 				#size-cells = <1>;
-				nand-ecc-mode = "none";
+				nand-ecc-mode = "on-die";
 
 				partitions {
 					compatible = "fixed-partitions";
